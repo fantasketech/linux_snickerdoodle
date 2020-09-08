@@ -14,6 +14,7 @@
 #include <linux/clk.h>
 #include <linux/component.h>
 #include <linux/device.h>
+#include <linux/gpio/consumer.h>
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/phy/phy.h>
@@ -104,6 +105,7 @@
 #define	XSDI_MODE_12G			5
 
 #define SDI_TIMING_PARAMS_SIZE		48
+#define CLK_RATE			148500000UL
 
 /**
  * enum payload_line_1 - Payload Ids Line 1 number
@@ -134,6 +136,8 @@ enum payload_line_2 {
  * @encoder: DRM encoder structure
  * @connector: DRM connector structure
  * @dev: device structure
+ * @gt_rst_gpio: GPIO handle to reset GT phy
+ * @picxo_rst_gpio: GPIO handle to reset picxo core
  * @base: Base address of SDI subsystem
  * @mode_flags: SDI operation mode related flags
  * @wait_event: wait event
@@ -179,6 +183,8 @@ struct xlnx_sdi {
 	struct drm_encoder encoder;
 	struct drm_connector connector;
 	struct device *dev;
+	struct gpio_desc *gt_rst_gpio;
+	struct gpio_desc *picxo_rst_gpio;
 	void __iomem *base;
 	u32 mode_flags;
 	wait_queue_head_t wait_event;
@@ -255,6 +261,20 @@ static void xlnx_sdi_en_bridge(struct xlnx_sdi *sdi)
 	data = xlnx_sdi_readl(sdi->base, XSDI_TX_RST_CTRL);
 	data |= XSDI_TX_BRIDGE_CTRL_EN;
 	xlnx_sdi_writel(sdi->base, XSDI_TX_RST_CTRL, data);
+}
+
+/**
+ * xlnx_sdi_gt_picxo_reset - Reset cores through gpio
+ * @sdi: Pointer to SDI Tx structure
+ *
+ * This function resets the GT phy and picxo cores.
+ */
+static void xlnx_sdi_gt_picxo_reset(struct xlnx_sdi *sdi)
+{
+	gpiod_set_value(sdi->gt_rst_gpio, 0);
+	gpiod_set_value(sdi->gt_rst_gpio, 1);
+	gpiod_set_value(sdi->picxo_rst_gpio, 0);
+	gpiod_set_value(sdi->picxo_rst_gpio, 1);
 }
 
 /**
@@ -852,6 +872,8 @@ static void xlnx_sdi_encoder_atomic_mode_set(struct drm_encoder *encoder,
 	struct videomode vm;
 	u32 payload, i;
 	u32 sditx_blank, vtc_blank;
+	unsigned long clkrate;
+	int ret;
 
 	/* Set timing parameters as per bridge output parameters */
 	xlnx_bridge_set_input(sdi->bridge, adjusted_mode->hdisplay,
@@ -878,6 +900,25 @@ static void xlnx_sdi_encoder_atomic_mode_set(struct drm_encoder *encoder,
 		}
 	}
 
+	/*
+	 * For the transceiver TX, for integer and fractional frame rate, the
+	 * PLL ref clock must be a different frequency. Other than SD mode
+	 * its 148.5MHz for an integer & 148.5/1.001 for fractional framerate.
+	 */
+	if (sdi->is_frac_prop_val && sdi->sdi_mod_prop_val != XSDI_MODE_SD)
+		clkrate = (CLK_RATE * 1000) / 1001;
+	else
+		clkrate = CLK_RATE;
+
+	ret = clk_set_rate(sdi->sditx_clk, clkrate);
+	if (ret)
+		dev_err(sdi->dev, "failed to set clk rate = %lu\n", clkrate);
+
+	clkrate = clk_get_rate(sdi->sditx_clk);
+	dev_dbg(sdi->dev, "clkrate = %lu is_frac = %d\n", clkrate,
+		sdi->is_frac_prop_val);
+
+	xlnx_sdi_gt_picxo_reset(sdi);
 	xlnx_sdi_setup(sdi);
 	xlnx_sdi_set_config_parameters(sdi);
 
@@ -1089,6 +1130,26 @@ static int xlnx_sdi_probe(struct platform_device *pdev)
 		dev_err(dev, "failed to enable vidin_clk %d\n", ret);
 		goto err_disable_sditx_clk;
 	}
+
+	sdi->gt_rst_gpio = devm_gpiod_get(&pdev->dev, "phy-reset",
+					  GPIOD_OUT_HIGH);
+	if (IS_ERR(sdi->gt_rst_gpio)) {
+		ret = PTR_ERR(sdi->gt_rst_gpio);
+		if (ret != -EPROBE_DEFER)
+			dev_err(&pdev->dev, "Unable to get phy gpio\n");
+		goto err_disable_vidin_clk;
+	}
+
+	sdi->picxo_rst_gpio = devm_gpiod_get_optional(&pdev->dev, "picxo-reset",
+						      GPIOD_OUT_HIGH);
+	if (IS_ERR(sdi->picxo_rst_gpio)) {
+		ret = PTR_ERR(sdi->picxo_rst_gpio);
+		if (ret != -EPROBE_DEFER)
+			dev_err(&pdev->dev, "Unable to get picxo gpio\n");
+		goto err_disable_vidin_clk;
+	}
+
+	xlnx_sdi_gt_picxo_reset(sdi);
 
 	/* in case all "port" nodes are grouped under a "ports" node */
 	ports = of_get_child_by_name(sdi->dev->of_node, "ports");

@@ -112,6 +112,22 @@ struct aie_dma_attr {
  * @get_tile_type: get type of tile based on tile operation
  * @get_mem_info: get different types of memories information
  * @reset_shim: reset shim, it will assert and then release SHIM reset
+ * @init_part_clk_state: initialize clock states software structure which is a
+ *			 bitmap for the AI engine partition. The clock states
+ *			 structure is the structure used to keep track of if
+ *			 the modules in the AI engine partition are gated.
+ * @scan_part_clocks: scan partition modules to check whether the modules are
+ *		      clock gated or not, and update the soft clock states
+ *		      structure. It is required to be called when the partition
+ *		      is requested so that the driver knows which modules are
+ *		      clock gated when the partition is requested. This function
+ *		      expects the caller to apply partition lock before calling
+ *		      this function.
+ * @set_part_clocks: set partition modules clocks gate registers based on the
+ *		     partition clock states bitmap. This function expects the
+ *		     caller to apply partition lock before calling this
+ *		     function. The caller function will need to set the bitmap
+ *		     on which tiles are required to be clocked on.
  *
  * Different AI engine device version has its own device
  * operation.
@@ -121,6 +137,9 @@ struct aie_tile_operations {
 	unsigned int (*get_mem_info)(struct aie_range *range,
 				     struct aie_part_mem *pmem);
 	int (*reset_shim)(struct aie_device *adev, struct aie_range *range);
+	int (*init_part_clk_state)(struct aie_partition *apart);
+	int (*scan_part_clocks)(struct aie_partition *apart);
+	int (*set_part_clocks)(struct aie_partition *apart);
 };
 
 /**
@@ -197,6 +216,7 @@ struct aie_part_bridge {
  * @range: range of partition
  * @mlock: protection for AI engine partition operations
  * @dev: device for the AI engine partition
+ * @cores_clk_state: bitmap to indicate the power state of core modules
  * @partition_id: partition id. Partition ID is the identifier
  *		  of the AI engine partition in the system.
  * @status: indicate if the partition is in use
@@ -213,6 +233,7 @@ struct aie_partition {
 	struct aie_range range;
 	struct mutex mlock; /* protection for AI engine partition operations */
 	struct device dev;
+	struct aie_resource cores_clk_state;
 	u32 partition_id;
 	u32 status;
 	u32 cntrflag;
@@ -322,6 +343,9 @@ int aie_resource_check_region(struct aie_resource *res, u32 start,
 int aie_resource_get_region(struct aie_resource *res, u32 start,
 			    u32 count);
 void aie_resource_put_region(struct aie_resource *res, int start, u32 count);
+int aie_resource_set(struct aie_resource *res, u32 start, u32 count);
+int aie_resource_clear(struct aie_resource *res, u32 start, u32 count);
+bool aie_resource_testbit(struct aie_resource *res, u32 bit);
 
 const struct file_operations *aie_part_get_fops(void);
 u8 aie_part_in_use(struct aie_partition *apart);
@@ -342,7 +366,16 @@ long aie_part_attach_dmabuf_req(struct aie_partition *apart,
 long aie_part_detach_dmabuf_req(struct aie_partition *apart,
 				void __user *user_args);
 long aie_part_set_bd(struct aie_partition *apart, void __user *user_args);
+long aie_part_set_dmabuf_bd(struct aie_partition *apart,
+			    void __user *user_args);
 void aie_part_release_dmabufs(struct aie_partition *apart);
 
-int aiev1_device_init(struct aie_device *adev);
+int aie_part_scan_clk_state(struct aie_partition *apart);
+bool aie_part_check_clk_enable_loc(struct aie_partition *apart,
+				   struct aie_location *loc);
+int aie_part_request_tiles_from_user(struct aie_partition *apart,
+				     void __user *user_args);
+int aie_part_release_tiles_from_user(struct aie_partition *apart,
+				     void __user *user_args);
+int aie_device_init(struct aie_device *adev);
 #endif /* AIE_INTERNAL_H */

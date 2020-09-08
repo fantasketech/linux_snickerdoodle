@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Xilinx AI Engine driver v1 specific implementation
+ * Xilinx AI Engine driver AIE device specific implementation
  *
  * Copyright (C) 2020 Xilinx, Inc.
  */
@@ -41,6 +41,9 @@
 #define AIE_SHIMPL_SHIMRST_MASK			0x1U
 #define AIE_SHIMPL_COLRST_MASK			0x1U
 #define AIE_SHIMPL_CLKCNTR_COLBUF_MASK		0x1U
+#define AIE_SHIMPL_CLKCNTR_NEXTCLK_MASK		BIT(1)
+#define AIE_TILE_CLKCNTR_COLBUF_MASK		BIT(0)
+#define AIE_TILE_CLKCNTR_NEXTCLK_MASK		BIT(1)
 
 /*
  * AI engine SHIM reset ID.
@@ -50,7 +53,7 @@
  */
 #define VERSAL_PM_RST_AIE_SHIM_ID			0xc10405fU
 
-static const struct aie_tile_regs aiev1_kernel_regs[] = {
+static const struct aie_tile_regs aie_kernel_regs[] = {
 	/* SHIM AXI MM Config */
 	{.attribute = AIE_TILE_TYPE_SHIMNOC << AIE_REGS_ATTR_TILE_TYPE_SHIFT,
 	 .soff = AIE_SHIMNOC_AXIMM_REGOFF,
@@ -97,17 +100,17 @@ static const struct aie_tile_regs aiev1_kernel_regs[] = {
 	},
 };
 
-static const struct aie_single_reg_field aiev1_col_rst = {
+static const struct aie_single_reg_field aie_col_rst = {
 	.mask = AIE_SHIMPL_COLRST_MASK,
 	.regoff = AIE_SHIMPL_COLRESET_REGOFF,
 };
 
-static const struct aie_single_reg_field aiev1_col_clkbuf = {
+static const struct aie_single_reg_field aie_col_clkbuf = {
 	.mask = AIE_SHIMPL_CLKCNTR_COLBUF_MASK,
 	.regoff = AIE_SHIMPL_CLKCNTR_REGOFF,
 };
 
-static const struct aie_dma_attr aiev1_shimdma = {
+static const struct aie_dma_attr aie_shimdma = {
 	.laddr = {
 		.mask = 0xffffffffU,
 		.regoff = 0U,
@@ -127,7 +130,7 @@ static const struct aie_dma_attr aiev1_shimdma = {
 
 static const struct zynqmp_eemi_ops *eemi_ops;
 
-static u32 aiev1_get_tile_type(struct aie_location *loc)
+static u32 aie_get_tile_type(struct aie_location *loc)
 {
 	if (loc->row)
 		return AIE_TILE_TYPE_TILE;
@@ -138,8 +141,8 @@ static u32 aiev1_get_tile_type(struct aie_location *loc)
 	return AIE_TILE_TYPE_SHIMNOC;
 }
 
-static unsigned int aiev1_get_mem_info(struct aie_range *range,
-				       struct aie_part_mem *pmem)
+static unsigned int aie_get_mem_info(struct aie_range *range,
+				     struct aie_part_mem *pmem)
 {
 	unsigned int i;
 
@@ -170,13 +173,13 @@ static unsigned int aiev1_get_mem_info(struct aie_range *range,
 }
 
 /**
- * aiev1_set_shim_reset() - Set AI engine SHIM reset
+ * aie_set_shim_reset() - Set AI engine SHIM reset
  * @adev: AI engine device
  * @range: range of AI engine tiles
  * @assert: true to set reset, false to unset reset
  */
-static void aiev1_set_shim_reset(struct aie_device *adev,
-				 struct aie_range *range, bool assert)
+static void aie_set_shim_reset(struct aie_device *adev,
+			       struct aie_range *range, bool assert)
 {
 	u32 c;
 	u32 val;
@@ -194,12 +197,12 @@ static void aiev1_set_shim_reset(struct aie_device *adev,
 	}
 }
 
-static int aiev1_reset_shim(struct aie_device *adev, struct aie_range *range)
+static int aie_reset_shim(struct aie_device *adev, struct aie_range *range)
 {
 	int ret;
 
 	/* Enable shim reset of each column */
-	aiev1_set_shim_reset(adev, range, true);
+	aie_set_shim_reset(adev, range, true);
 
 	/* Assert shim reset of AI engine array */
 	ret = eemi_ops->reset_assert(VERSAL_PM_RST_AIE_SHIM_ID,
@@ -218,40 +221,211 @@ static int aiev1_reset_shim(struct aie_device *adev, struct aie_range *range)
 	}
 
 	/* Disable shim reset of each column */
-	aiev1_set_shim_reset(adev, range, false);
+	aie_set_shim_reset(adev, range, false);
 
 	return 0;
 }
 
-static const struct aie_tile_operations aiev1_ops = {
-	.get_tile_type = aiev1_get_tile_type,
-	.get_mem_info = aiev1_get_mem_info,
-	.reset_shim = aiev1_reset_shim,
+static int aie_init_part_clk_state(struct aie_partition *apart)
+{
+	int ret, num_tiles;
+
+	num_tiles = apart->range.size.col * (apart->range.size.row - 1);
+
+	ret = aie_resource_initialize(&apart->cores_clk_state, num_tiles);
+	if (ret) {
+		dev_err(&apart->dev,
+			"failed to initialize cores clock state resource.\n");
+		return ret;
+	}
+
+	return 0;
+}
+
+static int aie_scan_part_clocks(struct aie_partition *apart)
+{
+	struct aie_device *adev = apart->adev;
+	struct aie_range *range = &apart->range;
+	struct aie_location loc;
+
+	/* Clear the bitmap of cores and memories clock state */
+	aie_resource_put_region(&apart->cores_clk_state, 0,
+				apart->cores_clk_state.total);
+
+	for (loc.col = range->start.col;
+	     loc.col < range->start.col + range->size.col;
+	     loc.col++) {
+		for (loc.row = range->start.row;
+		     loc.row < range->start.row + range->size.row - 1;
+		     loc.row++) {
+			void __iomem *va;
+			u32 val, nbitpos;
+
+			/*
+			 * Reading registers of the current tile to see the next
+			 * tile is clock gated.
+			 */
+			nbitpos = loc.col * (range->size.row - 1) + loc.row;
+
+			if (aie_get_tile_type(&loc) != AIE_TILE_TYPE_TILE) {
+				/* Checks shim tile for next core tile */
+				va = adev->base +
+				     aie_cal_regoff(adev, loc,
+						    AIE_SHIMPL_CLKCNTR_REGOFF);
+				val = ioread32(va);
+
+				/*
+				 * check if the clock buffer and the next clock
+				 * tile is set, if one of them is not set, the
+				 * tiles of the column are clock gated.
+				 */
+				if (!(val & AIE_SHIMPL_CLKCNTR_COLBUF_MASK) ||
+				    !(val & AIE_SHIMPL_CLKCNTR_NEXTCLK_MASK))
+					break;
+
+				/* Set next tile in the row clock state on */
+				aie_resource_set(&apart->cores_clk_state,
+						 nbitpos, 1);
+				continue;
+			}
+
+			/* Checks core tile for next tile */
+			va = adev->base +
+			     aie_cal_regoff(adev, loc,
+					    AIE_TILE_CORE_CLKCNTR_REGOFF);
+			val = ioread32(va);
+
+			/*
+			 * If the next tile is gated, skip the rest of the
+			 * column.
+			 */
+			if (!(val & AIE_TILE_CLKCNTR_NEXTCLK_MASK))
+				break;
+
+			aie_resource_set(&apart->cores_clk_state, nbitpos, 1);
+		}
+	}
+
+	return 0;
+}
+
+static int aie_set_part_clocks(struct aie_partition *apart)
+{
+	struct aie_device *adev = apart->adev;
+	struct aie_range *range = &apart->range;
+	struct aie_location loc;
+	u32 n;
+
+	/*
+	 * The tiles below the highest tile whose clock is on, need to have the
+	 * clock on. The first for loop is to scan the clock states bitmap to
+	 * see which tiles are required to be clocked on, and update the bitmap
+	 * to make sure the tiles below are also required to be clocked on.
+	 */
+	for (loc.col = range->start.col;
+	     loc.col < range->start.col + range->size.col;
+	     loc.col++) {
+		u32 startbit = loc.col * (range->size.row - 1), topbitn = 0;
+
+		for (loc.row = range->start.row + 1;
+		     loc.row < range->start.row + range->size.row;
+		     loc.row++) {
+			u32 bit = startbit + loc.row - 1;
+
+			if (aie_resource_testbit(&apart->cores_clk_state, bit))
+				topbitn = bit + 1;
+		}
+		if (topbitn) {
+			aie_resource_set(&apart->cores_clk_state, startbit,
+					 topbitn - startbit);
+		}
+	}
+
+	/*
+	 * This second for loop is to scan the clock states bitmap and set
+	 * AI engine registers to ungate the clock of the tiles which are
+	 * required to be clocked on.
+	 */
+	for (n = 0; n < apart->cores_clk_state.total;) {
+		bool clk_on = aie_resource_testbit(&apart->cores_clk_state, n);
+
+		/* Calculate location of the tile below */
+		loc.col = n / (range->size.row - 1);
+		loc.row = n % (range->size.row - 1);
+		if (loc.row == 0) {
+			void __iomem *va;
+			u32 val = 0;
+
+			/*
+			 * Configure SHIM clock registers to gate or ungate
+			 * next tile.
+			 */
+			if (clk_on)
+				val = AIE_SHIMPL_CLKCNTR_COLBUF_MASK |
+				      AIE_SHIMPL_CLKCNTR_NEXTCLK_MASK;
+			va = adev->base +
+			     aie_cal_regoff(adev, loc,
+					    AIE_SHIMPL_CLKCNTR_REGOFF);
+			iowrite32(val, va);
+		} else {
+			void __iomem *va;
+			u32 val = 0;
+
+			/*
+			 * Configure core tile clock registers to gate or
+			 * ungate next tile.
+			 */
+			if (clk_on)
+				val = AIE_TILE_CLKCNTR_COLBUF_MASK |
+				      AIE_TILE_CLKCNTR_NEXTCLK_MASK;
+			va = adev->base +
+			     aie_cal_regoff(adev, loc,
+					    AIE_TILE_CORE_CLKCNTR_REGOFF);
+			iowrite32(val, va);
+		}
+
+		/* If the tile clock is not on, jump to next column */
+		if (!clk_on)
+			n = (loc.col + 1) * (range->size.row - 1);
+		else
+			n++;
+	}
+
+	return 0;
+}
+
+static const struct aie_tile_operations aie_ops = {
+	.get_tile_type = aie_get_tile_type,
+	.get_mem_info = aie_get_mem_info,
+	.reset_shim = aie_reset_shim,
+	.init_part_clk_state = aie_init_part_clk_state,
+	.scan_part_clocks = aie_scan_part_clocks,
+	.set_part_clocks = aie_set_part_clocks,
 };
 
 /**
- * aiev1_device_init() - Initialize AI engine device struct v1 specific
+ * aie_device_init() - Initialize AI engine device struct AIE specific
  * @adev: AI engine device
  * @return: 0 for success, negative value for failure.
  *
  * This function initialize the AI engine device structure device version
  * specific elements such as register addressing related array shift,
- * column shift, and row shift; v1 specific device operations, device
+ * column shift, and row shift; AIE device specific device operations, device
  * columns resource.
  */
-int aiev1_device_init(struct aie_device *adev)
+int aie_device_init(struct aie_device *adev)
 {
 	int ret;
 
 	adev->array_shift = AIE_ARRAY_SHIFT;
 	adev->col_shift = AIE_COL_SHIFT;
 	adev->row_shift = AIE_ROW_SHIFT;
-	adev->ops = &aiev1_ops;
-	adev->num_kernel_regs = ARRAY_SIZE(aiev1_kernel_regs);
-	adev->kernel_regs = aiev1_kernel_regs;
-	adev->col_rst = &aiev1_col_rst;
-	adev->col_clkbuf = &aiev1_col_clkbuf;
-	adev->shim_dma = &aiev1_shimdma;
+	adev->ops = &aie_ops;
+	adev->num_kernel_regs = ARRAY_SIZE(aie_kernel_regs);
+	adev->kernel_regs = aie_kernel_regs;
+	adev->col_rst = &aie_col_rst;
+	adev->col_clkbuf = &aie_col_clkbuf;
+	adev->shim_dma = &aie_shimdma;
 
 	eemi_ops = zynqmp_pm_get_eemi_ops();
 	if (IS_ERR(eemi_ops) || !eemi_ops->reset_assert) {
