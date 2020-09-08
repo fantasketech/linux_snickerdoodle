@@ -145,6 +145,31 @@ struct aie_dma_bd_args {
 	__u32 bd_id;
 };
 
+/**
+ * struct aie_dmabuf_bd_args - AIE dmabuf buffer descriptor information
+ * @bd: DMA buffer descriptor, within the buffer descriptor, the address field
+ *	will be the offset to the start of the dmabuf
+ * @buf_fd: DMA buffer handler which is dmabuf file descriptor
+ * @loc: Tile location relative to the start of a partition
+ * @bd_id: buffer descriptor id
+ */
+struct aie_dmabuf_bd_args {
+	__u32 *bd;
+	struct aie_location loc;
+	int buf_fd;
+	__u32 bd_id;
+};
+
+/**
+ * struct aie_tiles_array - AIE tiles array
+ * @locs: tiles locations array
+ * @num_tiles: number of tiles in the tiles locations array
+ */
+struct aie_tiles_array {
+	struct aie_location *locs;
+	__u32 num_tiles;
+};
+
 #define AIE_IOCTL_BASE 'A'
 
 /* AI engine device IOCTL operations */
@@ -198,4 +223,39 @@ struct aie_dma_bd_args {
  */
 #define AIE_SET_SHIMDMA_BD_IOCTL	_IOW(AIE_IOCTL_BASE, 0xd, \
 					     struct aie_dma_bd_args)
+
+/**
+ * DOC: AIE_REQUEST_TILES_IOCTL - request AI engine tiles
+ *
+ * This ioctl is used to request tiles.
+ * When requested the AI engine partition, the kernel driver will scan the
+ * partition to track which tiles are enabled or not. After that, if user
+ * want to request for more tiles, it will use this ioctl to request more
+ * tiles.
+ * If the aie_tiles_array is empty, it means it will request for all tiles
+ * in the partition.
+ */
+#define AIE_REQUEST_TILES_IOCTL		_IOW(AIE_IOCTL_BASE, 0xe, \
+					     struct aie_tiles_array)
+
+/**
+ * DOC: AIE_RELEASE_TILES_IOCTL - release AI engine tiles
+ *
+ * This ioctl is used to release tiles
+ */
+#define AIE_RELEASE_TILES_IOCTL		_IOW(AIE_IOCTL_BASE, 0xf, \
+					     struct aie_tiles_array)
+
+/**
+ * DOC: AIE_SET_SHIMDMA_DMABUF_BD_IOCTL - set buffer descriptor which contains
+ *					  dmabuf to SHIM DMA
+ *
+ * This ioctl is used to set the buffer descriptor to SHIM DMA. The
+ * aie_dmabuf_bd_args contains the dmabuf fd and the buffer descriptor contents.
+ * The address field in the buffer descriptor contents should be the offset to
+ * the start of the dmabuf.
+ */
+#define AIE_SET_SHIMDMA_DMABUF_BD_IOCTL	_IOW(AIE_IOCTL_BASE, 0x10, \
+					     struct aie_dmabuf_bd_args)
+
 #endif
